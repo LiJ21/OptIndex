@@ -54,7 +54,7 @@ struct IdEqual {
 #ifdef SET_KN
 static constexpr size_t kN = SET_KN;
 #else
-static constexpr size_t kN = 100'000;
+static constexpr size_t kN = 10'000;
 #endif
 static constexpr size_t kBuckets = kN;
 
@@ -591,6 +591,7 @@ static void BM_MultiMap_ModifyX(benchmark::State &state) {
       m->modify<ByX>(
           *it, [](Particle &p) { p.x += 1.0; },
           [](Particle &p) { p.x -= 1.0; });
+      // std::cout << it->x << std::endl;
     }
     benchmark::DoNotOptimize(it);
     ++i;

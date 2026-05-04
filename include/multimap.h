@@ -54,26 +54,19 @@ public:
       auto &obj = mem_pool_[idx];
       new (&obj) ObjectType(std::forward<decltype(args)>(args)...);
       --free_count_;
-      live_mask_.set(idx);
       return reinterpret_cast<ObjectType *>(&obj);
     }
   }
 
   void remove(ObjectType &obj) {
-    assert(is_alive(obj));
     auto idx = get_index(obj);
     obj.~ObjectType();
     mem_pool_[idx].next_free_idx_ = free_head_;
     free_head_ = idx;
     ++free_count_;
-    live_mask_.reset(idx);
   }
 
   bool owns(ObjectType &obj) const { return get_index(obj) < mem_pool_.size(); }
-
-  bool is_alive(ObjectType &obj) const {
-    return live_mask_.test(get_index(obj));
-  }
 
   size_t size() const { return kSize - free_count_; }
 
@@ -82,8 +75,15 @@ public:
   bool full() const { return free_count_ == 0; }
 
   ~FixedSizeLifoPool() {
+    std::bitset<kSize> live_mask{};
+    size_t idx = free_head_;
+    live_mask.set();
+    while (idx < kSize) {
+      live_mask.reset(idx);
+      idx = mem_pool_[idx].next_free_idx_;
+    } 
     for (size_t i = 0; i < mem_pool_.size(); ++i) {
-      if (live_mask_.test(i)) {
+      if (live_mask.test(i)) {
         auto &obj = mem_pool_[i];
         reinterpret_cast<ObjectType &>(obj).~ObjectType();
       }
@@ -104,7 +104,6 @@ private:
   std::vector<MemSlot> mem_pool_;
   size_t free_head_{0};
   size_t free_count_{kSize};
-  std::bitset<kSize> live_mask_{};
 };
 
 template <size_t tIDX> struct Tag {};
@@ -122,6 +121,12 @@ template <typename TIndex, typename TTag> struct Unnamed<Named<TIndex, TTag>> {
 
 template <typename TIndex> struct Unnamed {
   using Index = TIndex;
+};
+
+template <typename T>
+concept COrderedIndex = requires {
+    typename T::KeyGetter;
+    typename T::Compare;
 };
 
 struct List {};
@@ -175,14 +180,12 @@ struct GetIndexByTagImpl<tIDX, TTag> {
 template <typename TIndexType, size_t tIDX> struct IndexTrait;
 template <size_t tIDX> struct IndexTrait<List, tIDX> : List {
   using Hook =
-      bi::list_base_hook<bi::link_mode<bi::safe_link>, bi::tag<Tag<tIDX>>>;
+      bi::list_base_hook<bi::link_mode<bi::normal_link>, bi::tag<Tag<tIDX>>>;
   template <typename TObject>
   using Container =
       bi::list<TObject, bi::base_hook<Hook>, bi::constant_time_size<true>>;
 
   static auto insert(auto &container, auto &obj) {
-    if (static_cast<const Hook &>(obj).is_linked())
-      return container.iterator_to(obj);
     container.push_back(obj);
     return container.iterator_to(obj);
   }
@@ -192,15 +195,13 @@ template <size_t tIDX, typename TKeyGetter, typename TCompare>
 struct IndexTrait<Ordered<TKeyGetter, TCompare>, tIDX>
     : Ordered<TKeyGetter, TCompare> {
   using Hook =
-      bi::set_base_hook<bi::link_mode<bi::safe_link>, bi::tag<Tag<tIDX>>>;
+      bi::set_base_hook<bi::link_mode<bi::normal_link>, bi::tag<Tag<tIDX>>>;
   template <typename TObject>
   using Container =
       bi::set<TObject, bi::base_hook<Hook>, bi::constant_time_size<true>,
               bi::key_of_value<TKeyGetter>, bi::compare<TCompare>,
               bi::optimize_size<false>>;
   static auto insert(auto &container, auto &obj) {
-    if (static_cast<const Hook &>(obj).is_linked())
-      return container.iterator_to(obj);
     typename std::remove_reference_t<decltype(container)>::insert_commit_data c;
 
     auto [it, ok] = container.insert_check(TKeyGetter{}(obj), c);
@@ -214,15 +215,13 @@ template <size_t tIDX, typename TKeyGetter, typename TCompare>
 struct IndexTrait<OrderedNonUnique<TKeyGetter, TCompare>, tIDX>
     : OrderedNonUnique<TKeyGetter, TCompare> {
   using Hook =
-      bi::set_base_hook<bi::link_mode<bi::safe_link>, bi::tag<Tag<tIDX>>>;
+      bi::set_base_hook<bi::link_mode<bi::normal_link>, bi::tag<Tag<tIDX>>>;
   template <typename TObject>
   using Container =
       bi::multiset<TObject, bi::base_hook<Hook>, bi::constant_time_size<true>,
                    bi::key_of_value<TKeyGetter>, bi::compare<TCompare>>;
 
   static auto insert(auto &container, auto &obj) {
-    if (static_cast<const Hook &>(obj).is_linked())
-      return container.iterator_to(obj);
     return container.insert(obj);
   }
 };
@@ -235,7 +234,7 @@ template <size_t tIDX, typename TKeyGetter, typename THash, typename TEqual,
           size_t tBuckets>
 struct IndexTrait<Unordered<TKeyGetter, THash, TEqual, tBuckets>, tIDX>
     : public Unordered<TKeyGetter, THash, TEqual, tBuckets> {
-  using Hook = bi::unordered_set_base_hook<bi::link_mode<bi::safe_link>,
+  using Hook = bi::unordered_set_base_hook<bi::link_mode<bi::normal_link>,
                                            bi::tag<Tag<tIDX>>>;
   template <typename TObject>
   struct Container
@@ -255,8 +254,6 @@ struct IndexTrait<Unordered<TKeyGetter, THash, TEqual, tBuckets>, tIDX>
     Container() : Base{}, SetType(BucketTraits(Base::buckets_, tBuckets)) {}
   };
   static auto insert(auto &container, auto &obj) {
-    if (static_cast<const Hook &>(obj).is_linked())
-      return container.iterator_to(obj);
     auto [it, ok] = container.insert(obj);
     if (!ok) {
       return container.end();
@@ -286,6 +283,7 @@ class MultiMap {
   template <typename TKeyGetter, typename TCompare>
   struct is_unique_index<OrderedNonUnique<TKeyGetter, TCompare>>
       : std::false_type {};
+
   static_assert(
       is_unique_index<std::tuple_element_t<0, std::tuple<TIndices...>>>::value,
       "Index 0 must be a unique index.");
@@ -313,6 +311,11 @@ class MultiMap {
 
   struct Slot : public Object, public inherit_helper<index_holder> {
     Slot(auto &&...args) : Object(std::forward<decltype(args)>(args)...) {}
+
+    bool is_linked(size_t idx) const { return linked_.test(idx); }
+    void link(size_t idx) { linked_.set(idx); }
+    void unlink(size_t idx) { linked_.reset(idx); }
+    std::bitset<sizeof...(TIndices)> linked_{};
   };
 
   template <typename... Ts> struct container_type<std::tuple<Ts...>> {
@@ -338,6 +341,7 @@ public:
 
     if (it == container.end())
       return container.cend();
+    it->link(tIDX);
     return container.iterator_to(const_cast<const Slot &>(*it));
   }
 
@@ -360,6 +364,7 @@ public:
       allocator_.remove(*pobj);
       return this->cend();
     }
+    this->to_mutable(*it).link(0);
 
     if constexpr (tAddAllIndices) {
       bool failed = [&]<size_t... Is>(std::index_sequence<Is...>) {
@@ -387,8 +392,7 @@ public:
   }
 
   template <size_t tIDX> const auto project(const Slot &slot) const {
-    using ToHook = typename std::tuple_element_t<tIDX, index_holder>::Hook;
-    if (!static_cast<const ToHook &>(slot).is_linked())
+    if (!slot.is_linked(tIDX))
       return get<tIDX>().cend();
     return get<tIDX>().iterator_to(slot);
   }
@@ -406,32 +410,77 @@ public:
   template <size_t... tIDXs>
   bool modify(const Slot &slot, auto &&mutate, auto &&rollback) {
     Slot &s = to_mutable(slot);
-
     static_assert(
         !(... || (tIDXs == 0)),
         "Primary index (0) cannot be reindexed. Use remove() instead.");
     auto reindex = [&](Slot &slot) {
       auto it = this->iterator_to(slot);
-      std::bitset<sizeof...(tIDXs)> linked_indices{};
+      mutate(slot);
+      std::bitset<sizeof...(tIDXs)> restore_indices{};
+
+      auto check_index = [&]<size_t tIDX>(Slot &s) {
+        if (!s.is_linked(tIDX))
+          return false;
+        auto &container = std::get<tIDX>(containers_);
+        auto it = container.iterator_to(s);
+        using Index = std::tuple_element_t<tIDX, std::tuple<TIndices...>>;
+        bool consistent = false;
+        if constexpr (COrderedIndex<Index>) {
+          using KeyGetter =
+              typename std::tuple_element_t<tIDX, index_holder>::KeyGetter;
+          using Compare =
+              typename std::tuple_element_t<tIDX, index_holder>::Compare;
+          auto prev_it =
+              it == container.begin() ? container.end() : std::prev(it);
+
+          auto next_it = std::next(it);
+          if constexpr (is_unique_index<Index>::value) {
+            consistent = prev_it == container.end() ||
+                         Compare{}(KeyGetter{}(*prev_it), KeyGetter{}(*it));
+            consistent &= next_it == container.end() ||
+                          Compare{}(KeyGetter{}(*it), KeyGetter{}(*next_it));
+          } else {
+            consistent = prev_it == container.end() ||
+                         !Compare{}(KeyGetter{}(*it), KeyGetter{}(*prev_it));
+            consistent &= next_it == container.end() ||
+                          !Compare{}(KeyGetter{}(*next_it), KeyGetter{}(*it));
+          }
+        }
+        return !consistent;
+      };
+
+      bool has_inconsistency = false;
       {
         size_t pos = 0;
-        (..., (linked_indices[pos++] = this->deindex<tIDXs>(it)));
+        (..., (has_inconsistency |= restore_indices[pos++] =
+                   check_index.template operator()<tIDXs>(s)));
       }
-      mutate(slot);
+      if (!has_inconsistency) {
+        return true;
+      }
+
+      {
+        size_t pos = 0;
+        (..., (restore_indices[pos++] && this->deindex<tIDXs>(it)));
+      }
 
       bool success = true;
       {
         size_t pos = 0;
-        (..., (success &= !linked_indices[pos++] ||
-                          this->index<tIDXs>(slot) != get<tIDXs>().end()));
+        (..., (success &= restore_indices[pos++]
+                              ? this->index<tIDXs>(slot) != get<tIDXs>().end()
+                              : true));
       }
 
       if (!success) {
         rollback(slot);
         size_t pos = 0;
         (..., ([&]() {
-           if (linked_indices[pos++])
+           if (restore_indices[pos++]) {
+             if (slot.is_linked(tIDXs))
+               this->deindex<tIDXs>(it);
              this->index<tIDXs>(slot);
+           }
          }()));
       }
       return success;
@@ -563,15 +612,14 @@ private:
   }
 
   template <size_t tIDX> bool erase_from_index(auto &&it) {
-    using Hook = typename std::tuple_element_t<tIDX, index_holder>::Hook;
-    auto &hook = static_cast<Hook &>(*it);
-    if (!hook.is_linked())
+    if (!it->is_linked(tIDX))
       return false;
     auto &container = std::get<tIDX>(containers_);
     if constexpr (tIDX == 0) {
       container.erase(it);
     } else {
       container.erase(container.iterator_to(*it));
+      it->unlink(tIDX);
     }
     return true;
   }

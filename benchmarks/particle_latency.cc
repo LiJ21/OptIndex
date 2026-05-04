@@ -121,6 +121,36 @@ using ParticleBMI = bmi::multi_index_container<Particle, BMIIndexedBy>;
 using ParticleBMIPool =
     bmi::multi_index_container<Particle, BMIIndexedBy, ParticleBMIAlloc>;
 
+// ---------------------------------------------------------------------------
+// Hot/Cold benchmark types
+// Hot entities: primary hash + BySeq (active list) + ByM (spatial bucket).
+// Cold entities: primary hash only (FastMM partial-index; BMI: cold_map).
+// ---------------------------------------------------------------------------
+using HotBMIIndexedBy = bmi::indexed_by<
+    bmi::hashed_unique<bmi::tag<ById>,
+                       bmi::member<Particle, uint64_t, &Particle::id>>,
+    bmi::sequenced<bmi::tag<BySeq>>,
+    bmi::ordered_non_unique<bmi::tag<ByM>,
+                            bmi::member<Particle, double, &Particle::m>>>;
+using HotOnlyBMI = bmi::multi_index_container<Particle, HotBMIIndexedBy>;
+using HotOnlyBMIPoolAlloc =
+    boost::fast_pool_allocator<Particle,
+                               boost::default_user_allocator_new_delete,
+                               boost::details::pool::null_mutex, kN>;
+using HotOnlyBMIPool =
+    bmi::multi_index_container<Particle, HotBMIIndexedBy, HotOnlyBMIPoolAlloc>;
+
+// 3-index FastMM map matching the slot footprint of HotOnlyBMI nodes.
+// Omits ByX and ByY so slot_size drops from 240 to 176 bytes.
+using HotColdParticleMap = fastmm::FixedSizeMultiMap<
+    Particle, kN,
+    fastmm::Unordered<fastmm::KeyFrom<&Particle::id>, IdHash, IdEqual,
+                      kBuckets>,
+    fastmm::Named<fastmm::List, BySeq>,
+    fastmm::Named<fastmm::OrderedNonUnique<fastmm::KeyFrom<&Particle::m>,
+                                           std::less<double>>,
+                  ByM>>;
+
 struct TestData {
   std::vector<uint64_t> ids;
   std::vector<double> xs, ys, ms;
@@ -198,6 +228,22 @@ static std::string format_ns(int64_t v) {
   return format_ns(static_cast<double>(v));
 }
 
+static std::string format_throughput(double mean_ns) {
+  if (mean_ns <= 0.0)
+    return "n/a";
+  double ops_per_s = 1e9 / mean_ns;
+  char buf[32];
+  if (ops_per_s >= 1e9)
+    std::snprintf(buf, sizeof(buf), "%.2f Gops/s", ops_per_s / 1e9);
+  else if (ops_per_s >= 1e6)
+    std::snprintf(buf, sizeof(buf), "%.1f Mops/s", ops_per_s / 1e6);
+  else if (ops_per_s >= 1e3)
+    std::snprintf(buf, sizeof(buf), "%.1f Kops/s", ops_per_s / 1e3);
+  else
+    std::snprintf(buf, sizeof(buf), "%.0f ops/s", ops_per_s);
+  return buf;
+}
+
 struct PercentileReport {
   std::string name;
   int64_t count{};
@@ -241,13 +287,14 @@ struct PercentileReport {
        << ",\"p999\":" << p999 << ",\"max\":" << max << "}";
   }
 
-  void print_gbench(std::ostream &os, int name_w, int time_w,
+  void print_gbench(std::ostream &os, int name_w, int time_w, int thput_w,
                     int iters_w) const {
     os << std::left << std::setw(name_w) << name << std::right
        << std::setw(time_w) << format_ns(mean) << std::setw(time_w)
        << format_ns(p50) << std::setw(time_w) << format_ns(p90)
        << std::setw(time_w) << format_ns(p99) << std::setw(time_w)
        << format_ns(p999) << std::setw(time_w) << format_ns(max)
+       << std::setw(thput_w) << format_throughput(mean)
        << std::setw(iters_w) << count << "\n";
   }
 };
@@ -786,6 +833,51 @@ struct MixedOpHistograms {
 private:
   static void init(const lb::BenchConfig &cfg, hdr_histogram *&hist) {
     if (hdr_init(cfg.hist_min, cfg.hist_max, cfg.sig_digits, &hist))
+      throw std::runtime_error("hdr_init failed");
+  }
+};
+
+struct HotColdOpHistograms {
+  hdr_histogram *transition_in{};   // cold→hot (warm up)
+  hdr_histogram *transition_out{};  // hot→cold (cool down)
+  hdr_histogram *update_hot{};      // modify hot entity (reindex ByM)
+  hdr_histogram *query_bucket{};    // equal_range on ByM hot index
+  hdr_histogram *churn_insert{};    // insert new cold entity
+  hdr_histogram *churn_remove{};    // remove cold entity
+
+  explicit HotColdOpHistograms(const lb::BenchConfig &cfg) {
+    init(cfg, transition_in);
+    init(cfg, transition_out);
+    init(cfg, update_hot);
+    init(cfg, query_bucket);
+    init(cfg, churn_insert);
+    init(cfg, churn_remove);
+  }
+
+  ~HotColdOpHistograms() {
+    hdr_close(transition_in);
+    hdr_close(transition_out);
+    hdr_close(update_hot);
+    hdr_close(query_bucket);
+    hdr_close(churn_insert);
+    hdr_close(churn_remove);
+  }
+
+  HotColdOpHistograms(const HotColdOpHistograms &) = delete;
+  HotColdOpHistograms &operator=(const HotColdOpHistograms &) = delete;
+
+  void reset() {
+    hdr_reset(transition_in);
+    hdr_reset(transition_out);
+    hdr_reset(update_hot);
+    hdr_reset(query_bucket);
+    hdr_reset(churn_insert);
+    hdr_reset(churn_remove);
+  }
+
+private:
+  static void init(const lb::BenchConfig &cfg, hdr_histogram *&h) {
+    if (hdr_init(cfg.hist_min, cfg.hist_max, cfg.sig_digits, &h))
       throw std::runtime_error("hdr_init failed");
   }
 };
@@ -1556,6 +1648,267 @@ run_bmi_near_capacity_churn(MixedState<Map> &state,
   lb::do_not_optimize(state.live_ids.size());
 }
 
+// ---------------------------------------------------------------------------
+// Hot/Cold Entity Mixed benchmark
+// Maintains N entities, α=20% hot (in BySeq + ByM), rest cold (primary only).
+// Each cycle: transition hot↔cold, update hot, query buckets, churn entities.
+// FastMM: native unindex<>/index<> — no data copy, O(1) primary lookup.
+// BMI:    HotOnlyBMI (3 indices) for hot + unordered_map for cold — copies on
+//         transition, modify reindexes all 3 hot indices unconditionally.
+// ---------------------------------------------------------------------------
+static constexpr size_t kHotN = kN / 5; // 20% hot
+static constexpr size_t kHCTransPerCycle = 4;
+static constexpr size_t kHCUpdatePerCycle = 32;
+static constexpr size_t kHCQueryPerCycle = 4;
+static constexpr size_t kHCChurnPerCycle = 2;
+static constexpr size_t kHCCycles = 1024;
+
+static double hot_cold_mass(size_t i) {
+  return static_cast<double>(i % 10 + 1);
+}
+
+// State: all_ids[0..hot_count) are hot; [hot_count..) are cold.
+// Cooling removes from the back of the hot section.
+// Warming promotes from the front of the cold section.
+// A single swap per transition keeps the invariant without a separate list.
+struct HotColdMMState {
+  std::unique_ptr<HotColdParticleMap> m;
+  std::vector<uint64_t> all_ids;
+  size_t hot_count{kHotN};
+  uint64_t next_id{kN + 1};
+  size_t probe{};
+};
+
+template <typename HotBMI>
+struct HotColdBMIState {
+  std::unordered_map<uint64_t, Particle> cold_map;
+  std::unique_ptr<HotBMI> hot_bmi;
+  std::vector<uint64_t> all_ids;
+  size_t hot_count{kHotN};
+  uint64_t next_id{kN + 1};
+  size_t probe{};
+};
+
+static HotColdMMState make_hot_cold_mm_state() {
+  HotColdMMState st;
+  st.m = std::make_unique<HotColdParticleMap>();
+  st.all_ids.reserve(kN);
+  for (size_t i = 0; i < kN; ++i) {
+    auto it = st.m->insert<false>(i + 1, generated_x(i), generated_y(i),
+                                  hot_cold_mass(i));
+    if (it == st.m->cend())
+      std::abort();
+    st.all_ids.push_back(i + 1);
+  }
+  for (size_t i = 0; i < kHotN; ++i) {
+    auto it = st.m->find_primary(st.all_ids[i]);
+    st.m->index<BySeq>(*it);
+    st.m->index<ByM>(*it);
+  }
+  return st;
+}
+
+template <typename HotBMI>
+static HotColdBMIState<HotBMI> make_hot_cold_bmi_state() {
+  HotColdBMIState<HotBMI> st;
+  st.hot_bmi = std::make_unique<HotBMI>();
+  st.hot_bmi->reserve(kHotN);
+  st.all_ids.reserve(kN);
+  st.cold_map.reserve(kN - kHotN);
+  for (size_t i = 0; i < kHotN; ++i) {
+    st.hot_bmi->emplace(i + 1, generated_x(i), generated_y(i),
+                        hot_cold_mass(i));
+    st.all_ids.push_back(i + 1);
+  }
+  for (size_t i = kHotN; i < kN; ++i) {
+    st.cold_map.try_emplace(i + 1, i + 1, generated_x(i), generated_y(i),
+                            hot_cold_mass(i));
+    st.all_ids.push_back(i + 1);
+  }
+  return st;
+}
+
+static void run_multimap_hot_cold(HotColdMMState &st,
+                                  HotColdOpHistograms *hists = nullptr) {
+  auto &m = *st.m;
+  for (size_t cycle = 0; cycle < kHCCycles; ++cycle) {
+    // 1. Cool kHCTransPerCycle hot entities (back of hot section → front of cold)
+    size_t n_cool = std::min(kHCTransPerCycle, st.hot_count);
+    for (size_t t = 0; t < n_cool; ++t) {
+      uint64_t id = st.all_ids[st.hot_count - 1 - t];
+      record_mixed_op(hists ? hists->transition_out : nullptr, [&] {
+        auto it = m.find_primary(id);
+        if (it != m.cend()) {
+          m.unindex<BySeq>(*it);
+          m.unindex<ByM>(*it);
+        }
+      });
+    }
+    // 2. Warm kHCTransPerCycle cold entities (front of cold section → back of hot)
+    size_t n_warm =
+        std::min(kHCTransPerCycle, st.all_ids.size() - st.hot_count);
+    for (size_t t = 0; t < n_warm; ++t) {
+      uint64_t id = st.all_ids[st.hot_count + t];
+      record_mixed_op(hists ? hists->transition_in : nullptr, [&] {
+        auto it = m.find_primary(id);
+        if (it != m.cend()) {
+          m.index<BySeq>(*it);
+          m.index<ByM>(*it);
+        }
+      });
+    }
+    // Swap cooled (tail of hot) with warmed (head of cold) to keep invariant
+    size_t n_swap = std::min(n_cool, n_warm);
+    for (size_t t = 0; t < n_swap; ++t)
+      std::swap(st.all_ids[st.hot_count - n_cool + t],
+                st.all_ids[st.hot_count + t]);
+
+    // 3. Update kHCUpdatePerCycle hot entities via BySeq (active list iteration).
+    //    FastMM: modify<ByM> reindexes only the bucket tree, skipping BySeq/id.
+    //    BMI:    modify reindexes all 3 hot indices even for unchanged seq/id keys.
+    {
+      auto &seq = m.get<BySeq>();
+      auto seq_it = seq.begin();
+      for (size_t u = 0; u < kHCUpdatePerCycle && seq_it != seq.end();
+           ++u, ++seq_it) {
+        record_mixed_op(hists ? hists->update_hot : nullptr, [&, cycle, u] {
+          m.modify<fastmm::ReindexOnlyByTag<ByM>>(
+              *seq_it, [cycle, u](Particle &p) {
+                p.m = static_cast<double>((cycle * 7 + u) % 10 + 1);
+              });
+        });
+      }
+    }
+
+    // 4. Query kHCQueryPerCycle buckets (hot ByM index only)
+    for (size_t q = 0; q < kHCQueryPerCycle; ++q) {
+      double mass = static_cast<double>((st.probe + q) % 10 + 1);
+      record_mixed_op(hists ? hists->query_bucket : nullptr, [&] {
+        auto &idx = m.get<ByM>();
+        auto [beg, end] = idx.equal_range(mass);
+        size_t count = 0;
+        for (auto it = beg; it != end; ++it)
+          ++count;
+        lb::do_not_optimize(count);
+      });
+    }
+
+    // 5. Churn: remove cold entity, insert new cold entity
+    for (size_t c = 0; c < kHCChurnPerCycle; ++c) {
+      if (st.all_ids.size() > st.hot_count) {
+        uint64_t id = st.all_ids.back();
+        st.all_ids.pop_back();
+        record_mixed_op(hists ? hists->churn_remove : nullptr,
+                        [&] { m.remove(id); });
+      }
+      uint64_t new_id = st.next_id++;
+      record_mixed_op(hists ? hists->churn_insert : nullptr, [&] {
+        auto it = m.insert<false>(new_id, generated_x(new_id % kN),
+                                  generated_y(new_id % kN),
+                                  hot_cold_mass(new_id));
+        if (it != m.cend())
+          st.all_ids.push_back(new_id);
+      });
+    }
+
+    st.probe += kHCUpdatePerCycle;
+  }
+  lb::do_not_optimize(m.size());
+  lb::do_not_optimize(st.all_ids.size());
+}
+
+template <typename HotBMI>
+static void run_bmi_hot_cold(HotColdBMIState<HotBMI> &st,
+                             HotColdOpHistograms *hists = nullptr) {
+  auto &hot = *st.hot_bmi;
+  auto &hot_idx = hot.template get<ById>();
+
+  for (size_t cycle = 0; cycle < kHCCycles; ++cycle) {
+    // 1. Cool kHCTransPerCycle hot entities (erase from hot_bmi, store in cold_map)
+    size_t n_cool = std::min(kHCTransPerCycle, st.hot_count);
+    for (size_t t = 0; t < n_cool; ++t) {
+      uint64_t id = st.all_ids[st.hot_count - 1 - t];
+      record_mixed_op(hists ? hists->transition_out : nullptr, [&] {
+        auto it = hot_idx.find(id);
+        if (it != hot_idx.end()) {
+          st.cold_map.try_emplace(id, *it);
+          hot_idx.erase(it);
+        }
+      });
+    }
+    // 2. Warm kHCTransPerCycle cold entities (move from cold_map to hot_bmi)
+    size_t n_warm =
+        std::min(kHCTransPerCycle, st.all_ids.size() - st.hot_count);
+    for (size_t t = 0; t < n_warm; ++t) {
+      uint64_t id = st.all_ids[st.hot_count + t];
+      record_mixed_op(hists ? hists->transition_in : nullptr, [&] {
+        auto cm_it = st.cold_map.find(id);
+        if (cm_it != st.cold_map.end()) {
+          hot.emplace(cm_it->second);
+          st.cold_map.erase(cm_it);
+        }
+      });
+    }
+    size_t n_swap = std::min(n_cool, n_warm);
+    for (size_t t = 0; t < n_swap; ++t)
+      std::swap(st.all_ids[st.hot_count - n_cool + t],
+                st.all_ids[st.hot_count + t]);
+
+    // 3. Update kHCUpdatePerCycle hot entities via BySeq iteration.
+    //    BMI modify reindexes all 3 hot indices (ByID, BySeq, ByM) even though
+    //    only the ByM position may change.
+    {
+      auto &seq = hot.template get<BySeq>();
+      auto seq_it = seq.begin();
+      for (size_t u = 0; u < kHCUpdatePerCycle && seq_it != seq.end();
+           ++u) {
+        auto cur = seq_it++;
+        record_mixed_op(hists ? hists->update_hot : nullptr, [&, cycle, u] {
+          seq.modify(cur, [cycle, u](Particle &p) {
+            p.m = static_cast<double>((cycle * 7 + u) % 10 + 1);
+          });
+        });
+      }
+    }
+
+    // 4. Query kHCQueryPerCycle buckets (hot ByM index only)
+    for (size_t q = 0; q < kHCQueryPerCycle; ++q) {
+      double mass = static_cast<double>((st.probe + q) % 10 + 1);
+      record_mixed_op(hists ? hists->query_bucket : nullptr, [&] {
+        auto &idx = hot.template get<ByM>();
+        auto [beg, end] = idx.equal_range(mass);
+        size_t count = 0;
+        for (auto it = beg; it != end; ++it)
+          ++count;
+        lb::do_not_optimize(count);
+      });
+    }
+
+    // 5. Churn: remove cold entity, insert new cold entity
+    for (size_t c = 0; c < kHCChurnPerCycle; ++c) {
+      if (st.all_ids.size() > st.hot_count) {
+        uint64_t id = st.all_ids.back();
+        st.all_ids.pop_back();
+        record_mixed_op(hists ? hists->churn_remove : nullptr,
+                        [&] { st.cold_map.erase(id); });
+      }
+      uint64_t new_id = st.next_id++;
+      record_mixed_op(hists ? hists->churn_insert : nullptr, [&] {
+        auto [it, ok] = st.cold_map.try_emplace(
+            new_id, new_id, generated_x(new_id % kN), generated_y(new_id % kN),
+            hot_cold_mass(new_id));
+        if (ok)
+          st.all_ids.push_back(new_id);
+      });
+    }
+
+    st.probe += kHCUpdatePerCycle;
+  }
+  lb::do_not_optimize(hot.size());
+  lb::do_not_optimize(st.cold_map.size());
+  lb::do_not_optimize(st.all_ids.size());
+}
+
 static auto make_multimap_mixed_state_with_initial(size_t initial) {
   return make_mixed_state<ParticleMap>(
       initial, [] { return std::make_unique<ParticleMap>(); },
@@ -1810,6 +2163,87 @@ static void register_mixed_benches() {
       });
 }
 
+// ---------------------------------------------------------------------------
+// Hot/Cold benchmark registration
+// ---------------------------------------------------------------------------
+static lb::BenchConfig hot_cold_cfg() {
+  lb::BenchConfig cfg;
+  cfg.warmup_iters = 2;
+  cfg.measure_iters = 20;
+  apply_iteration_override(cfg);
+  return cfg;
+}
+
+template <typename Setup, typename Fn>
+static void register_hot_cold_latency_bench(const char *base_name,
+                                             lb::BenchConfig cfg,
+                                             Setup &&setup, Fn &&fn) {
+  const std::string base{base_name};
+  std::vector<std::string> out_names{
+      base + "_HotCold_TransIn",     base + "_HotCold_TransOut",
+      base + "_HotCold_UpdateHot",   base + "_HotCold_QueryBucket",
+      base + "_HotCold_ChurnInsert", base + "_HotCold_ChurnRemove"};
+
+  registry().push_back(
+      {base + "_HotCold", out_names,
+       [out_names, cfg, setup = std::forward<Setup>(setup),
+        fn = std::forward<Fn>(fn)]() mutable {
+         HotColdOpHistograms hists(cfg);
+
+         for (int64_t i = 0; i < cfg.warmup_iters; ++i) {
+           auto state = setup();
+           lb::clobber_memory();
+           fn(state, nullptr);
+           lb::clobber_memory();
+         }
+
+         hists.reset();
+         for (int64_t i = 0; i < cfg.measure_iters; ++i) {
+           auto state = setup();
+           lb::clobber_memory();
+           fn(state, &hists);
+           lb::clobber_memory();
+         }
+
+         std::vector<DetailedReport> reports;
+         auto add = [&](const std::string &name, hdr_histogram *h) {
+           if (h->total_count > 0)
+             reports.push_back(DetailedReport::from(name, h));
+         };
+         add(out_names[0], hists.transition_in);
+         add(out_names[1], hists.transition_out);
+         add(out_names[2], hists.update_hot);
+         add(out_names[3], hists.query_bucket);
+         add(out_names[4], hists.churn_insert);
+         add(out_names[5], hists.churn_remove);
+         return reports;
+       }});
+}
+
+static void register_hot_cold_benches() {
+  auto cfg = hot_cold_cfg();
+
+  register_hot_cold_latency_bench(
+      "MultiMap", cfg, [] { return make_hot_cold_mm_state(); },
+      [](HotColdMMState &st, HotColdOpHistograms *h) {
+        run_multimap_hot_cold(st, h);
+      });
+
+  register_hot_cold_latency_bench(
+      "DefaultBMI", cfg,
+      [] { return make_hot_cold_bmi_state<HotOnlyBMI>(); },
+      [](HotColdBMIState<HotOnlyBMI> &st, HotColdOpHistograms *h) {
+        run_bmi_hot_cold(st, h);
+      });
+
+  register_hot_cold_latency_bench(
+      "PoolBMI", cfg,
+      [] { return make_hot_cold_bmi_state<HotOnlyBMIPool>(); },
+      [](HotColdBMIState<HotOnlyBMIPool> &st, HotColdOpHistograms *h) {
+        run_bmi_hot_cold(st, h);
+      });
+}
+
 static void register_all_benches() {
   const char *const create[] = {"MultiMap_Create", "DefaultBMI_Create",
                                 "PoolBMI_Create"};
@@ -1864,6 +2298,18 @@ static void register_all_benches() {
                                "PoolBMI_Mixed_FindPrimary",
                                "PoolBMI_Mixed_Modify",
                                "PoolBMI_Mixed_Remove"};
+  const char *const hot_cold[] = {
+      "MultiMap_HotCold",                 "DefaultBMI_HotCold",
+      "PoolBMI_HotCold",                  "MultiMap_HotCold_TransIn",
+      "MultiMap_HotCold_TransOut",        "MultiMap_HotCold_UpdateHot",
+      "MultiMap_HotCold_QueryBucket",     "MultiMap_HotCold_ChurnInsert",
+      "MultiMap_HotCold_ChurnRemove",     "DefaultBMI_HotCold_TransIn",
+      "DefaultBMI_HotCold_TransOut",      "DefaultBMI_HotCold_UpdateHot",
+      "DefaultBMI_HotCold_QueryBucket",   "DefaultBMI_HotCold_ChurnInsert",
+      "DefaultBMI_HotCold_ChurnRemove",   "PoolBMI_HotCold_TransIn",
+      "PoolBMI_HotCold_TransOut",         "PoolBMI_HotCold_UpdateHot",
+      "PoolBMI_HotCold_QueryBucket",      "PoolBMI_HotCold_ChurnInsert",
+      "PoolBMI_HotCold_ChurnRemove"};
 
   if (should_register_any(create))
     register_create_benches();
@@ -1883,6 +2329,8 @@ static void register_all_benches() {
     register_level_walk_benches();
   if (should_register_any(mixed))
     register_mixed_benches();
+  if (should_register_any(hot_cold))
+    register_hot_cold_benches();
 }
 
 static void print_gbench_table(std::ostream &os,
@@ -1932,8 +2380,9 @@ static void print_gbench_table(std::ostream &os,
   }
 
   constexpr int kTimeW = 14;
+  constexpr int kThputW = 16;
   constexpr int kItersW = 11;
-  int total_w = name_w + 6 * kTimeW + kItersW;
+  int total_w = name_w + 6 * kTimeW + kThputW + kItersW;
   std::string sep(total_w, '-');
 
   os << sep << "\n";
@@ -1941,12 +2390,13 @@ static void print_gbench_table(std::ostream &os,
      << std::setw(kTimeW) << "Mean" << std::setw(kTimeW) << "p50"
      << std::setw(kTimeW) << "p90" << std::setw(kTimeW) << "p99"
      << std::setw(kTimeW) << "p99.9" << std::setw(kTimeW) << "Max"
+     << std::setw(kThputW) << "Throughput"
      << std::setw(kItersW) << "Iters"
      << "\n";
   os << sep << "\n";
 
   for (const auto &r : reports)
-    r.summary.print_gbench(os, name_w, kTimeW, kItersW);
+    r.summary.print_gbench(os, name_w, kTimeW, kThputW, kItersW);
 
   os << sep << "\n";
 
