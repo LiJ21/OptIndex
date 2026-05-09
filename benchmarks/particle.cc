@@ -15,6 +15,7 @@
 #include <boost/multi_index/tag.hpp>
 #include <boost/multi_index_container.hpp>
 #include <boost/pool/pool_alloc.hpp>
+#include <functional>
 #include <memory>
 #include <random>
 #include <vector>
@@ -53,7 +54,7 @@ struct IdEqual {
 #ifdef SET_KN
 static constexpr size_t kN = SET_KN;
 #else
-static constexpr size_t kN = 100'000;
+static constexpr size_t kN = 10'000;
 #endif
 static constexpr size_t kBuckets = kN;
 
@@ -62,18 +63,43 @@ struct ByX {};
 struct ByY {};
 struct ByM {};
 struct BySeq {};
+
+#if defined(WITH_HASH) && WITH_HASH
+using ParticlePrimaryIndex = fastmm::Unordered<fastmm::KeyFrom<&Particle::id>,
+                                               IdHash, IdEqual, kBuckets>;
+using BMIPriIndex =
+    bmi::hashed_unique<bmi::tag<ById>,
+                       bmi::member<Particle, uint64_t, &Particle::id>>;
+#else
+using ParticlePrimaryIndex =
+    fastmm::Ordered<fastmm::KeyFrom<&Particle::id>, std::less<uint64_t>>;
+using BMIPriIndex =
+    bmi::ordered_unique<bmi::tag<ById>,
+                        bmi::member<Particle, uint64_t, &Particle::id>>;
+#endif
+
 using ParticleMap = fastmm::FixedSizeMultiMap<
-    Particle, kN,
-    fastmm::Unordered<fastmm::KeyFrom<&Particle::id>, IdHash, IdEqual,
-                      kBuckets>,
+    Particle, kN, fastmm::Named<ParticlePrimaryIndex, ById>,
+#if defined(REV_INDEX) && REV_INDEX
+    fastmm::Named<fastmm::List, BySeq>,
     fastmm::Named<
         fastmm::Ordered<fastmm::KeyFrom<&Particle::x>, std::less<double>>, ByX>,
     fastmm::Named<
         fastmm::Ordered<fastmm::KeyFrom<&Particle::y>, std::less<double>>, ByY>,
     fastmm::Named<fastmm::OrderedNonUnique<fastmm::KeyFrom<&Particle::m>,
                                            std::less<double>>,
+                  ByM>
+#else
+    fastmm::Named<fastmm::List, BySeq>,
+    fastmm::Named<fastmm::OrderedNonUnique<fastmm::KeyFrom<&Particle::m>,
+                                           std::less<double>>,
                   ByM>,
-    fastmm::Named<fastmm::List, BySeq>>;
+    fastmm::Named<
+        fastmm::Ordered<fastmm::KeyFrom<&Particle::y>, std::less<double>>, ByY>,
+    fastmm::Named<
+        fastmm::Ordered<fastmm::KeyFrom<&Particle::x>, std::less<double>>, ByX>
+#endif
+    >;
 
 // ---------------------------------------------------------------------------
 // Boost.MultiIndex setup
@@ -84,8 +110,7 @@ using ParticleBMIAlloc =
                                boost::details::pool::null_mutex, kN>;
 
 using BMIIndexedBy = bmi::indexed_by<
-    bmi::hashed_unique<bmi::tag<ById>,
-                       bmi::member<Particle, uint64_t, &Particle::id>>,
+    BMIPriIndex,
     bmi::ordered_unique<bmi::tag<ByX>,
                         bmi::member<Particle, double, &Particle::x>>,
     bmi::ordered_unique<bmi::tag<ByY>,
@@ -97,6 +122,31 @@ using BMIIndexedBy = bmi::indexed_by<
 using ParticleBMI = bmi::multi_index_container<Particle, BMIIndexedBy>;
 using ParticleBMIPool =
     bmi::multi_index_container<Particle, BMIIndexedBy, ParticleBMIAlloc>;
+
+template <typename Map> static void reserve_primary_hash_if_enabled(Map &m) {
+#if defined(WITH_HASH) && WITH_HASH
+  m.reserve(kN);
+#else
+  (void)m;
+#endif
+}
+
+template <typename Map> static void rehash_primary_if_enabled(Map &m) {
+#if defined(WITH_HASH) && WITH_HASH
+  m.template get<ById>().rehash(kN);
+#else
+  (void)m;
+#endif
+}
+
+template <typename Map> static void prepare_bmi(Map &m) {
+  reserve_primary_hash_if_enabled(m);
+}
+
+template <typename Map> static void prepare_pool_bmi(Map &m) {
+  reserve_primary_hash_if_enabled(m);
+  rehash_primary_if_enabled(m);
+}
 
 // ---------------------------------------------------------------------------
 // Shared test data — generated once, reused across benchmarks
@@ -150,9 +200,16 @@ static auto make_multimap() {
   return m;
 }
 
+static auto make_multimap_primary_only() {
+  auto m = std::make_unique<ParticleMap>();
+  for (size_t i = 0; i < kN; ++i)
+    m->insert<false>(kData.ids[i], kData.xs[i], kData.ys[i], kData.ms[i]);
+  return m;
+}
+
 static auto make_bmi() {
   auto m = std::make_unique<ParticleBMI>();
-  m->reserve(kN);
+  prepare_bmi(*m);
   for (size_t i = 0; i < kN; ++i)
     m->insert(Particle{kData.ids[i], kData.xs[i], kData.ys[i], kData.ms[i]});
   return m;
@@ -160,8 +217,7 @@ static auto make_bmi() {
 
 static auto make_bmi_pool() {
   auto m = std::make_unique<ParticleBMIPool>();
-  m->reserve(kN);
-  m->get<ById>().rehash(kN);
+  prepare_pool_bmi(*m);
   for (size_t i = 0; i < kN; ++i)
     m->insert(Particle{kData.ids[i], kData.xs[i], kData.ys[i], kData.ms[i]});
   return m;
@@ -190,7 +246,7 @@ static void BM_BMI_Create(benchmark::State &state) {
   for (auto _ : state) {
     state.PauseTiming();
     auto m = std::make_unique<ParticleBMI>();
-    m->reserve(kN);
+    prepare_bmi(*m);
     state.ResumeTiming();
     for (size_t i = 0; i < kN; ++i)
       m->insert(Particle{kData.ids[i], kData.xs[i], kData.ys[i], kData.ms[i]});
@@ -207,8 +263,7 @@ static void BM_PoolBMI_Create(benchmark::State &state) {
   for (auto _ : state) {
     state.PauseTiming();
     auto m = std::make_unique<ParticleBMIPool>();
-    m->reserve(kN);
-    m->get<ById>().rehash(kN);
+    prepare_pool_bmi(*m);
     state.ResumeTiming();
     for (size_t i = 0; i < kN; ++i)
       m->insert(Particle{kData.ids[i], kData.xs[i], kData.ys[i], kData.ms[i]});
@@ -523,6 +578,65 @@ static void BM_PoolBMI_Modify(benchmark::State &state) {
 BENCHMARK(BM_PoolBMI_Modify)->Unit(benchmark::kNanosecond);
 
 // ---------------------------------------------------------------------------
+// BM: Modify (reindex x after mutation)
+// ---------------------------------------------------------------------------
+static void BM_MultiMap_ModifyX(benchmark::State &state) {
+  auto m = make_multimap(); // via unique_ptr
+  size_t i = 0;
+  for (auto _ : state) {
+    // Always modify mass (non-unique — never conflicts, no extra find needed)
+    auto id = kData.lookup_ids[i % kData.lookup_ids.size()];
+    auto it = m->find_primary(id);
+    if (it != m->cend()) {
+      m->modify<ByX>(
+          *it, [](Particle &p) { p.x += 1.0; },
+          [](Particle &p) { p.x -= 1.0; });
+      // std::cout << it->x << std::endl;
+    }
+    benchmark::DoNotOptimize(it);
+    ++i;
+  }
+}
+BENCHMARK(BM_MultiMap_ModifyX)->Unit(benchmark::kNanosecond);
+
+static void BM_BMI_ModifyX(benchmark::State &state) {
+  auto m = make_bmi();
+  auto &idx = m->get<ById>();
+  size_t i = 0;
+  for (auto _ : state) {
+    auto id = kData.lookup_ids[i % kData.lookup_ids.size()];
+    auto it = idx.find(id);
+    if (it != idx.end()) {
+      // Force modification of all indices — fair comparison
+      idx.modify(
+          it, [i](Particle &p) { p.x += 1.0; },
+          [](Particle &p) { p.x -= 1.0; });
+    }
+    benchmark::DoNotOptimize(it);
+    ++i;
+  }
+}
+BENCHMARK(BM_BMI_ModifyX)->Unit(benchmark::kNanosecond);
+
+static void BM_PoolBMI_ModifyX(benchmark::State &state) {
+  auto m = make_bmi_pool();
+  auto &idx = m->get<ById>();
+  size_t i = 0;
+  for (auto _ : state) {
+    auto id = kData.lookup_ids[i % kData.lookup_ids.size()];
+    auto it = idx.find(id);
+    if (it != idx.end()) {
+      idx.modify(
+          it, [i](Particle &p) { p.x += 1.0; },
+          [](Particle &p) { p.x -= 1.0; });
+    }
+    benchmark::DoNotOptimize(it);
+    ++i;
+  }
+}
+BENCHMARK(BM_PoolBMI_ModifyX)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
 // BM: Distinct level walk (upper_bound pattern — price level sweep)
 // ---------------------------------------------------------------------------
 static void BM_MultiMap_LevelWalk(benchmark::State &state) {
@@ -560,6 +674,59 @@ static void BM_PoolBMI_LevelWalk(benchmark::State &state) {
   }
 }
 BENCHMARK(BM_PoolBMI_LevelWalk)->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// BM: FastMM partial indexing — remove from one secondary index only
+// ---------------------------------------------------------------------------
+template <typename TTag>
+static void BM_MultiMap_UnindexSecondary(benchmark::State &state) {
+  for (auto _ : state) {
+    state.PauseTiming();
+    auto m = make_multimap();
+    state.ResumeTiming();
+
+    size_t removed = 0;
+    for (auto it = m->cbegin(); it != m->cend(); ++it)
+      removed += m->unindex<TTag>(*it) ? 1 : 0;
+    benchmark::DoNotOptimize(removed);
+    benchmark::DoNotOptimize(m->size());
+
+    state.PauseTiming();
+    m.reset();
+    state.ResumeTiming();
+  }
+  state.SetItemsProcessed(state.iterations() * kN);
+}
+
+static void BM_MultiMap_UnindexMissingByX(benchmark::State &state) {
+  for (auto _ : state) {
+    state.PauseTiming();
+    auto m = make_multimap_primary_only();
+    state.ResumeTiming();
+
+    size_t removed = 0;
+    for (auto it = m->cbegin(); it != m->cend(); ++it)
+      removed += m->unindex<ByX>(*it) ? 1 : 0;
+    benchmark::DoNotOptimize(removed);
+    benchmark::DoNotOptimize(m->size());
+
+    state.PauseTiming();
+    m.reset();
+    state.ResumeTiming();
+  }
+  state.SetItemsProcessed(state.iterations() * kN);
+}
+
+BENCHMARK_TEMPLATE(BM_MultiMap_UnindexSecondary, ByX)
+    ->Name("BM_MultiMap_UnindexByX")
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_MultiMap_UnindexSecondary, ByM)
+    ->Name("BM_MultiMap_UnindexByM")
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_MultiMap_UnindexSecondary, BySeq)
+    ->Name("BM_MultiMap_UnindexBySeq")
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_MultiMap_UnindexMissingByX)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // BM: Mixed workload — multi-phase churn
@@ -708,7 +875,7 @@ static void BM_BMI_Mixed(benchmark::State &state) {
     state.PauseTiming();
 
     auto m = std::make_unique<ParticleBMI>();
-    m->reserve(kN);
+    prepare_bmi(*m);
     std::vector<uint64_t> live_ids;
     live_ids.reserve(kN);
 
@@ -828,7 +995,7 @@ static void BM_PoolBMI_Mixed(benchmark::State &state) {
     state.PauseTiming();
 
     auto m = std::make_unique<ParticleBMIPool>();
-    m->reserve(kN);
+    prepare_pool_bmi(*m);
     std::vector<uint64_t> live_ids;
     live_ids.reserve(kN);
 
