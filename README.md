@@ -1,17 +1,6 @@
-# fastmm
+# OptIndex: One storage, optional and partitioned views
 
-`fastmm::FixedSizeMultiMap` is a fixed-capacity, low-latency object store where secondary index membership is *optional*, mutation must preserve cross-index invariants, and failure/rollback must work even when an object is only present in some views.
-
-The target workload is not "storing a lot of stuff somehow and maximizing throughput." (although throughput may not be too bad for a broad range of workloads) It is the tighter case where the same object is hit over and over through different access patterns:
-
-- hash lookup by a primary key
-- ordered traversal by one or more fields
-- non-unique grouping/range queries
-- insertion-order iteration
-- mixed-field access once the object is found
-- modify and reindex in selected views
-
-In other words: one object, many (optional) views, no duplicated payload, no need to keep several containers manually in sync, and everything designed in a real-time friendly manner.
+`optindex::OptIndex` is an object store targeted at low latency applications. The philosophy is indicated in the name: it allows for optional and partitioned indexing, or *views*, over a collection of objects. Any mutation must preserve cross-index invariants, and failure/rollback must work even when an object is only partially indexed. On one hand, it provides centralized storage management and RAII guarantees, similar to std containers, and compile-time multi-indexing resembling Boost.MultiIndex. On the other hand, it provides very flexible mechanism allowing for partial and partitioned indexing, allowing for efficient insertion, removal, and iterating over different *views*, as well as zero-cost *migration* between partitioned indices.
 
 ## Why this exists
 
@@ -22,36 +11,37 @@ If you already know the object count upper bound and you care about latency, the
 - allocator traffic and fragmentation show up at the wrong time
 - locality gets worse when hot objects are spread out
 
-While `boost::multi_index` has existed for years and is a powerful general-purpose solution, it is not specifically designed for fixed-capacity, low-latency workloads. In particular, its model assumes that each object participates in all views, whereas modern C++ makes it possible to explore a more tailored design: one centered on stable storage, optional secondary indexing, and minimal overhead for mixed lookup and traversal patterns.
-
-Hence, this library takes the following choices:
+In this context, Boost.MultiIndex and Boost.Intrusive are popular tools and somehow represent two extremes of the design space. The MultiIndex has existed for years and is a powerful general-purpose solution, while its model assumes that each object participates in all views. This essentially forbids the case of partial indexing: some of the objects may have only "retired" from some indices and the same key may need to be partitioned or bucketed into different indices. Intrusive, however,is relatively more recent and provides very flexible building blocks for the indexing layer, allowing the user to decide the full logic of inserting into/removing from individual containers and assuming essentially nothing about the lifetime and ownership of the underlying objects. One therefore has to be very careful to define and enforce necessary contracts to guarantee objects are consistently managed. 
+ 
+OptIndex tries to fill the space between the two, and to pinpoint a recurring paradigm that is both safe and maximally flexible:
 
 - store each object once
-- attach multiple indices to that one object (via `boost::intrusive` containers)
+- attach multiple hooks to that one object, to which indices can be attached (via `boost::intrusive` containers)
 - choose the index set at compile time
-- allow for indexing/unindexing objects within individual containers at runtime.
-- use a fixed-size LIFO pool for storage
+- allow one hook to have multiple possible indices (partitioned index), but enforce one-index-a-time contract.
+- allow for indexing/unindexing objects within individual containers at runtime
+- compatible with std::allocator_traits while shipped with a fixed-size LIFO pool for storage (can be replaced with any std-compatible allocators)
 
-That gives you a unified interface for repeated mixed queries with minimal runtime machinery.
+That gives you a unified interface for repeated mixed queries with minimal runtime machinery, allowing for flexible use cases with intrusive containers.
 
-## Design logic
+## Design
 
 The design is intentionally simple.
 
-**1. Fixed capacity.**  
-Capacity is part of the type. If the pool is full, insertion fails cleanly.
-
-**2. Policy-based indices.**  
+**1. Policy-based indices.**  
 The index set is declared in the type. No virtual dispatch, no runtime registry, no dynamic query planner. You pay for the indices you ask for.
 
-**3. One object, many indices.**  
+**2. One object, many indices.**  
 The payload exists once. The indices are just alternate access paths to the same object.
 
-**4. LIFO memory pool.**  
-Storage comes from a fixed pool with LIFO reuse. The point is to avoid general-purpose allocator noise, reduce fragmentation, and keep recently-touched slots hot when the workload is bursty.
+**3. LIFO memory pool.**  
+This is not mandatory but the default storage comes from a fixed pool with LIFO reuse. The point is to avoid general-purpose allocator noise, reduce fragmentation, and keep recently-touched slots hot when the workload is bursty. `optindex::FixedSizeOptIndex` uses this pool by default.
 
-**5. Explicit indexing control when needed.**  
-You can insert into the primary index only, then opt into selected secondary indices later. That matters when object construction and indexing have to be staged. This is the most significant difference in design, compared with similar libraries such as `boost::multi_index`, as we allow for partial indexing in general. 
+**4. Explicit indexing control when needed.**  
+You can insert into the primary index only, then opt into selected secondary indices later. That matters when object construction and indexing have to be staged. This is the most significant difference in design compared with similar libraries such as `boost::multi_index`, as we allow for partial indexing in general.
+
+**6. K>1 partitioned buckets.**  
+A single `IndexBy` can declare multiple tags that share one intrusive hook. At most one tag can be active per slot at a time — the encoded membership is stored in a compact bitfield. This lets you partition objects into disjoint categories (e.g. Low/Mid/High) without allocating a separate hook per bucket. Migrating an object from one bucket to another is a `unindex<OldTag>` + `insert<NewTag>` pair.
 
 ## When it fits
 
@@ -76,7 +66,7 @@ The examples below use the same `Particle` type and index setup as the benchmark
 ```cpp
 #include <cstddef>
 #include <cstdint>
-#include "multimap.h"
+#include "optindex.h"
 
 struct Particle {
   uint64_t id;
@@ -88,81 +78,58 @@ struct Particle {
       : id(id), x(x), y(y), m(m) {}
 };
 
-struct Idgetter {
-  using type = uint64_t;
-  const uint64_t& operator()(const Particle& p) const { return p.id; }
-};
-struct Xgetter {
-  using type = double;
-  const double& operator()(const Particle& p) const { return p.x; }
-};
-struct Ygetter {
-  using type = double;
-  const double& operator()(const Particle& p) const { return p.y; }
-};
-struct Mgetter {
-  using type = double;
-  const double& operator()(const Particle& p) const { return p.m; }
-};
-
-struct IdHash {
-  std::size_t operator()(uint64_t id) const {
-    return std::hash<uint64_t>{}(id);
-  }
-};
-struct IdEqual {
-  bool operator()(uint64_t a, uint64_t b) const { return a == b; }
-};
 struct ById {};
 struct ByX {};
 struct ByY {};
 struct ByM {};
 struct BySeq {};
+
 static constexpr std::size_t kMaxParticles = 64;
 
-using ParticleMap = fastmm::FixedSizeMultiMap<
+using ParticleMap = optindex::FixedSizeOptIndex<
     Particle, kMaxParticles,
-    fastmm::Unordered<Idgetter, IdHash, IdEqual, 128>,
-    fastmm::Named<fastmm::Ordered<Xgetter, std::less<double>>, ByX>,
-    fastmm::Named<fastmm::Ordered<Ygetter, std::less<double>>, ByY>,
-    fastmm::Named<fastmm::OrderedNonUnique<Mgetter, std::less<double>>, ByM>,
-    fastmm::Named<fastmm::List>, BySeq>;
+    optindex::Ordered<optindex::KeyFrom<&Particle::id>, std::less<uint64_t>>,
+    optindex::IndexBy<optindex::Ordered<optindex::KeyFrom<&Particle::x>, std::less<double>>, ByX>,
+    optindex::IndexBy<optindex::Ordered<optindex::KeyFrom<&Particle::y>, std::less<double>>, ByY>,
+    optindex::IndexBy<optindex::OrderedNonUnique<optindex::KeyFrom<&Particle::m>, std::less<double>>, ByM>,
+    optindex::IndexBy<optindex::List, BySeq>>;
 ```
 
 This map has five views over the same `Particle` objects:
 
-- index `0`: unordered unique primary index by `id`
-- index `1` (`ByX`): ordered unique index by `x`
-- index `2` (`ByY`): ordered unique index by `y`
-- index `3` (`ByM`): ordered non-unique index by `m` (particle "mass")
-- index `4` (`BySeq`): insertion-order list
+- primary index: ordered unique by `id`
+- `ByX`: ordered unique secondary index by `x`
+- `ByY`: ordered unique secondary index by `y`
+- `ByM`: ordered non-unique secondary index by `m` (particle mass)
+- `BySeq`: insertion-order list
 
-We can imagine a simple game where particles can move in the two-dimensional space. Each of `x` and `y` coordinates are can not be identical for any two particles, just for simplicity in benchmarks interpretation (indeed, we can easily define composite key `(x, y)`). We will want to add/remove particles, iterate over them in different orders (inserting order, id, or ascending order in `x`/`y`), and find all particles with the same mass (an `equal_range` search for `boost::multiset`).
+We can imagine a simple game where particles can move in the two-dimensional space. Each of `x` and `y` coordinates cannot be identical for any two particles. We will want to add/remove particles, iterate over them in different orders (insertion order, by id, or ascending `x`/`y`), and find all particles with the same mass.
 
 ## Basic usage
 
 ### Insert
 
-Insert and index into all configured indices:
+Create and index into all configured secondary indices:
 
 ```cpp
 ParticleMap map;
 
-auto it = map.insert<true>(1, 0.0, 0.0, 1.0);
+auto it = map.create_all(1, 0.0, 0.0, 1.0);
 if (it == map.cend()) {
-  // insert failed: capacity exhausted or a unique index rejected it
+  // failed: capacity exhausted or a unique index rejected it
 }
 ```
 
-If `insert<true>` hits a conflict in a secondary unique index, the insert is rolled back completely. The object does not survive in the primary index as a half-inserted entry.
+If `create_all` hits a conflict in a secondary unique index, the insert is rolled back completely. The object does not survive in the primary index as a half-inserted entry.
 
-Insert into the primary index only:
+Create into the primary index only, then opt into secondary indices:
 
 ```cpp
-auto it = map.insert<false>(99, 7.0, 8.0, 3.0);
+auto it = map.create(99, 7.0, 8.0, 3.0);
 if (it != map.cend()) {
-  map.index<ByX>(*it);  // add to x-index
-  map.index<BySeq>(*it);  // add to list index
+  map.insert<ByX>(*it);   // add to x-index
+  map.insert<BySeq>(*it); // add to list index
+  // ByY and ByM remain unlinked
 }
 ```
 
@@ -173,7 +140,6 @@ That is useful when secondary indexing is conditional or staged.
 ```cpp
 auto it = map.find_primary(42u);
 if (it != map.cend()) {
-  // full object is available directly
   double x = it->x;
   double y = it->y;
 }
@@ -238,17 +204,16 @@ bool removed = map.remove<ByX>(3.14);  // remove by x
 ### Deindex a secondary view without deleting the object
 
 ```cpp
-auto it = map.insert<true>(1, 1.0, 1.0, 1.0);
+auto it = map.create_all(1, 1.0, 1.0, 1.0);
 
-map.unindex<ByX>(*it);  // remove from x-index only
+map.unindex<ByX>(*it);  // remove from x-index only; object stays in primary
 
-// object is still alive in the primary index
-auto again = map.find_primary(1u);
+auto again = map.find_primary(1u);  // still found
 ```
 
 ### Project across indices
 
-If you found an object through one index and want the iterator for another index, use `project<N>`:
+If you found an object through one index and want the iterator for another index, use `project<Tag>`:
 
 ```cpp
 auto& mi = map.get<ByM>();
@@ -262,185 +227,226 @@ if (mit != mi.cend()) {
 }
 ```
 
-If the object is not currently indexed in the target index, `project<N>` returns that index's `end()`.
+If the object is not currently indexed in the target index, `project<Tag>` returns that index's `end()`.
 
 ### Modify and reindex one field
 
-If you mutate a field that participates in an index, reindex that index explicitly:
+If you mutate a field that participates in an index, pass the affected tags to `modify`:
 
 ```cpp
-auto it = map.insert<true>(1, 1.0, 3.0, 2.0);
+auto it = map.create_all(1, 1.0, 3.0, 2.0);
 
-bool ok =
-    map.modify<fastmm::ReindexOnly<ByX>>(*it,
-                                       [](Particle& p) { p.x = 9.0; });
+bool ok = map.modify<optindex::ReindexOnly<ByX>>(
+    *it, [](Particle& p) { p.x = 9.0; });
 
 if (!ok) {
   // unique-index conflict; original state was restored
 }
 ```
 
-For unique indices, conflicting reindex operations fail and roll back cleanly.  
-For non-unique indices, reindex succeeds as expected:
+For non-unique indices, reindex always succeeds:
 
 ```cpp
-map.modify<fastmm::ReindexOnly<ByM>>(*it,
-                                   [](Particle& p) { p.m = 7.0; });
+map.modify<optindex::ReindexOnly<ByM>>(
+    *it, [](Particle& p) { p.m = 7.0; });
 ```
 
-In general, one can specify one of three reindex policies (`ReindexAll`, `ReindexNone`, `ReindexOnly`). Note that the method skips any unlinked index even if it is included in the policy. That is to say, the policy is only for optimization purpose: When you know exactly what you want to change, then specify; for explicit "reindexing", use `insert` instead.
-
-## Alternate key declaration: `KeyFrom`
-
-If you do not want separate getter structs, member pointers work too, one 
-can also skip the tag and use the oridinal position to refer to an index:
+`modify` checks whether the slot is out of order after mutation and only unindexes and reindexes if needed. Unlinked tags are skipped. You can name multiple tags to reindex in one call:
 
 ```cpp
-using ParticleMapKF = fastmm::FixedSizeMultiMap<
+map.modify<optindex::ReindexOnly<ByX, ByY>>(
+    *it, [](Particle& p) { p.x = 2.0; p.y = 4.0; });
+```
+
+### K>1 partitioned buckets
+
+One `IndexBy` can carry multiple tags sharing a single intrusive hook. Objects belong to at most one tag at a time, with membership encoded in a compact bitfield. This lets you partition objects into disjoint categories without per-object extra overhead:
+
+```cpp
+struct BktLow  {};
+struct BktMid  {};
+struct BktHigh {};
+
+using ParticleBuckets = optindex::FixedSizeOptIndex<
     Particle, kMaxParticles,
-    fastmm::Unordered<fastmm::KeyFrom<&Particle::id>, IdHash, IdEqual, 128>,
-    fastmm::Ordered<fastmm::KeyFrom<&Particle::x>, std::less<double>>,
-    fastmm::Ordered<fastmm::KeyFrom<&Particle::y>, std::less<double>>,
-    fastmm::OrderedNonUnique<fastmm::KeyFrom<&Particle::m>, std::less<double>>,
-    fastmm::List>;
+    optindex::Ordered<optindex::KeyFrom<&Particle::id>, std::less<uint64_t>>,
+    optindex::IndexBy<optindex::List, BktLow, BktMid, BktHigh>>;
+
+ParticleBuckets map;
+auto it = map.create(1, 0.0, 0.0, 2.5);
+
+map.insert<BktLow>(*it);   // link to low bucket
+
+// Migrate to high bucket: unindex, update the bucket-driving state, then insert.
+// The container enforces one active bucket per hook; your code owns the
+// domain rule that decides which bucket is correct.
+map.unindex<BktLow>(*it);
+map.modify<optindex::ReindexNone>(*it, [](Particle& p) { p.m = 9.0; });
+map.insert<BktHigh>(*it);
+
+// Iterate one bucket only
+for (const auto& p : map.get<BktHigh>()) { /* ... */ }
 ```
 
-That gives the same behavior with less boilerplate when the key is just a data member.
+`insert<Tag>` returns `false` if the slot is already occupied by any tag in the same `IndexBy` group — call `unindex<OldTag>` first.
 
 ## Semantics at a glance
 
-- `insert<true>(...)`  
-  Create object and index it into all configured indices.
+- `create(...)`  
+  Create object and index it into the primary only.
 
-- `insert<false>(...)`  
-  Create object in the primary index only.
+- `create_all(...)`  
+  Create object and index it into all configured secondary indices.
 
-- `index<N>(obj)`  
-  Add an existing object to index `N`.
+- `insert<Tag>(obj)`  
+  Add an existing object to secondary index `Tag`. Returns `false` if already linked to any tag in the same slot.
 
-- `unindex<N>(obj)`  
-  Remove an object from index `N` only.
+- `unindex<Tag>(obj)`  
+  Remove an object from secondary index `Tag` only. Returns `false` if not linked.
 
-- `get<N>()`  
-  Access index `N`.
+- `get<Tag>()`
+  Access the container for secondary index `Tag`.
 
 - `find_primary(key)`  
-  Find through the primary unordered index.
+  Find through the primary index.
 
 - `remove(obj)`  
-  Remove the object from the container entirely.
+  Remove the object from the container entirely (all secondaries + primary, destroys slot).
 
-- `remove<N>(key)`  
-  Remove by key through index `N` when that operation is supported.
+- `remove<Tag>(key)`  
+  Remove by secondary key when the index is unique.
 
-- `project<N>(obj_or_iterator_value)`  
-  Get the iterator for the same object in index `N`, or `end()` if the object is not present there.
+- `project<Tag>(obj)`  
+  Get the iterator for the same object in `Tag`'s container, or `end()` if not linked there.
 
-- `modify<fastmm::ReindexOnly<N>>(obj, fn)`  
-  Mutate the object and reindex only index `N`.
+- `modify<optindex::ReindexOnly<Tags...>>(obj, fn)`
+  Mutate the object and reindex only the listed tags that are out of order. Rolls back on unique-index conflict.
 
 ## Failure model
 
 This library aims to fail in boring ways.
 
-- Pool exhaustion returns `end()`.
+- Pool exhaustion returns `cend()`.
 - Duplicate primary keys are rejected.
-- Secondary unique-index conflicts during `insert<true>` roll back the whole insert.
-- Unique-index conflicts during `modify<ReindexOnly<N>>` roll back the object state.
-- `project<N>` returns `end()` when the object is not in index `N`.
+- Secondary unique-index conflicts during `create_all` roll back the whole insert.
+- Unique-index conflicts during `modify` roll back the object state.
+- `project<Tag>` returns `end()` when the object is not linked in that index.
+- `insert<Tag>` returns `false` when the slot is already occupied (no silent migration).
 
 That is the intended contract: no ghost entries, no half-updated indices, no dangling hooks after a normal failed operation.
 
 ## Notes
 
-This is a fixed-size, policy-driven container for a specific low-latency workload. It is not trying to be a general-purpose database or a universal associative container. If your object count is bounded and the same objects must be hit through several access paths repeatedly, that is the use case it is built for.
+This is an intrusive-based container for a specific low-latency workload. It is not trying to be a general-purpose database or a universal associative container. Especially if your object count is bounded and the same objects must be hit through several access paths (potentially partitioned) repeatedly, that is the use case it is built for.
 
 ## Benchmarks
 
-Benchmarks compare three implementations against Google Benchmark on an Intel i7 (Linux):
+Benchmarks compare four implementations with Google Benchmark:
 
-- **MM** — `fastmm::MultiMap` (this library)
-- **PoolBMI** — `boost::multi_index` with `boost::fast_pool_allocator`. The container is reserved at the beginning to minize allocation difference.
-- **BMI** — `boost::multi_index` with the default allocator
+- **OptIndex** - `optindex::FixedSizeOptIndex` with one ordered, non-unique mass index.
+- **PartOI** - `optindex::FixedSizeOptIndex` with the mass index replaced by `K=10` partitioned list buckets.
+- **PoolBMI** - `boost::multi_index` with `boost::fast_pool_allocator`.
+- **BMI** - `boost::multi_index` with the default allocator.
 
-The benchmark fixture uses a the above-mentioned "Particle" payload, exposing indices `{id, x, y, m}`: a primary hash index on `id`, ordered indices on `x` and `y` (for range queries), and a secondary hash index on `m`. It is enlarged by a few other fields to a full payload of `112` Bytes.
+The benchmark fixture uses the same `Particle` idea as the examples, but with a larger `112` byte payload. The current gbench data was generated on 2026-05-16 with `WITH_HASH=true`, so the primary `id` lookup is hashed for all implementations. The other views are ordered unique indices on `x` and `y`, an insertion-order sequence, and either an ordered `m` index (`OptIndex`, `BMI`, `PoolBMI`) or ten integer mass buckets (`PartOI`).
 
-Two layout variants are tested: **aligned** (`id, x, y, m` in declaration order) and **reversed** (`id, m, y, x`), which affects cache-line layout and iterator access patterns.
+That last difference matters: `PartOI` is not a drop-in replacement for an ordered non-unique mass index. It is a specialized layout for the benchmark's discrete integer mass distribution. It is the right comparison if your workload can use partitioned buckets, but it should not be read as a general ordered-index result.
 
-Following results are time-per-operation in nanoseconds at **kN = 100,000** elements. 
+Two index-layout variants are measured: the default layout and `REV_INDEX=true`, which changes the secondary hook/index order while leaving the payload fields fixed. Most rows below are isolated operation-level microbenchmarks; `MixedSteadyState` is a composed pressure scenario.
 
-### Aligned layout (id, x, y, m)
+The following tables report medians from 200 stored gbench repetitions at **kN = 100,000**. Lower is better. `BulkIterate` and `OrderedIterate` are normalized to ns/particle. `MassRange` is shown as us/op, `MixedSteadyState` as ms/op, and the remaining rows as ns/op. The generated CSV also contains p5/p95 bands, which are important for the noisier traversal rows.
 
-| Operation | MM (ns) | PoolBMI (ns) | BMI (ns) | Notes |
-|---|---|---|---|---|
-| **Create** | **478** | 508 | 522 | Insert + index all keys |
-| **FindPrimary** | 4.1 | 2.3 | 2.3 | Hash lookup by `id` |
-| **Modify** | **68** | 142 | 147 | Rekey across all indices |
-| **Remove** | **137** | 134 | 158 | Erase + unlink all hooks |
-| **BulkIterate** | **337k** | 355k | 405k | Iterate all elements |
-| **OrderedIterate** | 3,769k | 2,826k | 3,175k | In-order traversal |
-| **LevelWalk** | **236** | 250 | 264 | Per-node price-level walk |
-| **MassRange** | 206k | 186k | 170k | Large ordered range scan |
-| **Mixed** | **21.7M** | 29.3M | 31.2M | Realistic workload mix |
+### Default index layout
 
-### Reversed layout (id, m, y, x)
+| Operation | PartOI | OptIndex | PoolBMI | BMI | Notes |
+|---|---:|---:|---:|---:|---|
+| **Create** | 361 ns | 467 ns | 510 ns | 527 ns | Insert and index all views |
+| **FindPrimary** | 4.11 ns | 4.11 ns | 2.20 ns | 2.21 ns | Hashed lookup by `id` |
+| **Modify** | 30.7 ns | 113 ns | 174 ns | 176 ns | Move mass to another level/bucket |
+| **ModifyX** | 17.8 ns | 18.5 ns | 141 ns | 142 ns | Rekey ordered unique `x` |
+| **Remove** | 111 ns | 138 ns | 136 ns | 162 ns | Erase by primary key |
+| **BulkIterate** | 3.93 ns | 4.45 ns | 3.65 ns | 3.91 ns | Insertion-order scan |
+| **OrderedIterate** | 24.6 ns | 26.3 ns | 28.8 ns | 27.6 ns | Ordered `x` traversal |
+| **LevelWalk** | 3.08 ns | 237 ns | 254 ns | 265 ns | Distinct mass-level walk |
+| **MassRange** | 126 us | 185 us | 184 us | 176 us | Count matching mass range/bucket |
+| **MixedSteadyState** | 1.85 ms | 2.69 ms | 2.56 ms | 2.82 ms | Churn, mass updates, lookups, and scan |
 
-| Operation | MM (ns) | PoolBMI (ns) | BMI (ns) | Notes |
-|---|---|---|---|---|
-| **Create** | **465** | 507 | 519 | |
-| **FindPrimary** | 4.1 | 2.3 | 2.3 | |
-| **Modify** | **65** | 134 | 142 | |
-| **Remove** | 141 | **134** | 162 | |
-| **OrderedIterate** | **2,604k** | 2,823k | 3,207k | MM wins here (see below) |
-| **Mixed** | **25.8M** | 27.4M | 28.2M | |
+### Reversed index layout
+
+| Operation | PartOI | OptIndex | PoolBMI | BMI | Notes |
+|---|---:|---:|---:|---:|---|
+| **Create** | 363 ns | 470 ns | 509 ns | 525 ns | Insert and index all views |
+| **FindPrimary** | 4.11 ns | 4.11 ns | 2.21 ns | 2.21 ns | Hashed lookup by `id` |
+| **Modify** | 30.9 ns | 111 ns | 173 ns | 175 ns | Move mass to another level/bucket |
+| **ModifyX** | 18.8 ns | 19.5 ns | 149 ns | 154 ns | Rekey ordered unique `x` |
+| **Remove** | 112 ns | 143 ns | 135 ns | 162 ns | Erase by primary key |
+| **BulkIterate** | 3.99 ns | 4.40 ns | 3.67 ns | 3.98 ns | Insertion-order scan |
+| **OrderedIterate** | 31.9 ns | 37.5 ns | 28.7 ns | 26.4 ns | Ordered `x` traversal |
+| **LevelWalk** | 3.09 ns | 231 ns | 253 ns | 265 ns | Distinct mass-level walk |
+| **MassRange** | 126 us | 186 us | 183 us | 170 us | Count matching mass range/bucket |
+| **MixedSteadyState** | 1.88 ms | 2.98 ms | 2.55 ms | 2.82 ms | Churn, mass updates, lookups, and scan |
 
 ### Key findings
-**Mixed workload** is the primary story. Under a realistic interleaving of inserts, lookups, modifications, and removes, MM is consistently **30–45% faster** than BMI and **25–35% faster** than PoolBMI across all container sizes. This reflects the core design advantage: a single fixed-capacity pool means no heap allocation on the hot path, no per-element allocator overhead, and cache-warm LIFO reuse of freed nodes.
-![Mixed workload](benchmarks/data/particle/plots_time_per_op_compare/Mixed.png)
-* Mixed workload performance
-  
-![Mixed workload (Reversed layout)](benchmarks/data/particle_r/plots_time_per_op_compare/Mixed.png)
-* reversed layout
 
-**Modify** shows the starkest single-operation advantage: **~2× faster** than BMI. This is expected — a `Modify` in MM is an in-place rekey with pointer surgery on intrusive hooks. Although both MM and BMI have to erase and reinsert with allocator involvement, the target index can be specified by the user in the MM case, saving the overhead of dealing with others.
-![Modify workload](benchmarks/data/particle/plots_time_per_op_compare/Modify.png)
-* Modify and reindex (for a single key)
-  
-![Modify workload (Reversed layout)](benchmarks/data/particle_r/plots_time_per_op_compare/Modify.png)
-* reversed layout
+**Partitioned mass buckets change the shape of mass-centric work.** `PartOI` is consistently fastest for `Create`, `Remove`, `Modify`, `LevelWalk`, and `MassRange` in this sweep. This is expected rather than magical: the benchmark mass values are integers in `{1..10}`, so `PartOI` can replace tree work with direct bucket work. That is an algorithmic/layout win, not a small constant-factor trick.
 
-**FindPrimary** is the one consistent loss: MM runs at ~4 ns vs ~2 ns for both BMI variants, regardless of container size or layout. This appears to be an i7-specific issue (reversed on Apple M1, data not included). The likely cause is the slightly larger node size (payload + hooks) than MultiIndex, as the iteration seems basic. Further investigation pending.
-![FindPrimary workload](benchmarks/data/particle/plots_time_per_op_compare/FindPrimary.png)
-* Search the primary key (hash)
-  
-![FindPrimary workload (Reversed layout)](benchmarks/data/particle_r/plots_time_per_op_compare/FindPrimary.png)
-* reversed layout
+![MassRange benchmark](benchmarks/data/gbench/figs/MassRange.png)
+*Mass range or bucket count, default index layout.*
 
-**OrderedIterate (Tree Traversal)** this is an interesting one. Here the percentage in difference is shown, as the absolute magnitude rises very quickly, making it difficult to see. From first look, it is surprising to see that PoolBMI quickly *outperforms* MM for aligned layout with increasing `kN`, while with reversed layout it is the opposite: MM is generally *faster* than PoolBMI. This turned out to be a memory effect issue: In the reversed layout, the header fields (`ByX`) accessed during ordered traversal are farther from the indexed field `x` in the struct, causing the traversal to skip two cache lines (64 Byte) per node (vs one for aligned) and improves L2/L3 utilization. This is a memory layout effect, which dominates the constant factor paricularly for large. BMI becomes very unstable in both cases, which is expected from its "allocate when needed" policy.
-![OrderedIterate workload](benchmarks/data/particle/plots_time_per_op_compare/OrderedIterate_relative.png)
-* Iterate the ordered index x (tree traversal)
-  
-![OrderedIterate workload (Reversed layout)](benchmarks/data/particle_r/plots_time_per_op_compare/OrderedIterate_relative.png)
-* reversed layout
+![LevelWalk benchmark](benchmarks/data/gbench/figs/LevelWalk.png)
+*Level walking across discrete mass values, default index layout.*
 
-**PoolBMI vs BMI**: From the above results we also see that adding a pool allocator to BMI consistently improves it, sometimes matching MM on individual operations (Remove at reversed layout). However, the Mixed benchmark reliably separates them: pool allocation alone does not replicate MM's structural locality benefits. This is probably due to the clean policy based design of MM, which leads to minimal overhead at the cost of being more tailored to specific applications.
+**Reindexing one ordered unique field is where OptIndex's intrusive design is clearest.** `OptIndex` and `PartOI` are around `18-20 ns` for `ModifyX` at 100k, while the Boost.MultiIndex variants are around `141-154 ns`. In this run the plain and partitioned OptIndex variants are close enough that the useful claim is "same fast class", not that one reliably beats the other.
+
+![ModifyX benchmark](benchmarks/data/gbench/figs/ModifyX.png)
+*Modify and reindex `x`, default index layout.*
+
+**Primary lookup remains a Boost.MultiIndex win on this machine.** With hashed primary indices enabled, `BMI`/`PoolBMI` are around `2.2 ns`, while `OptIndex`/`PartOI` are around `4.1 ns`. The absolute gap is small, but the relative gap is real in this microbenchmark. Anecdotal Apple M1 runs have shown the opposite ordering, so this row should be treated as architecture-sensitive rather than a universal lookup ranking.
+
+![FindPrimary benchmark](benchmarks/data/gbench/figs/FindPrimary.png)
+*Primary key lookup, default index layout.*
+
+**Traversal is mixed and layout-sensitive.** `PoolBMI` leads the insertion-order scan (`BulkIterate` over a list-like index) at 100k. Ordered `x` traversal is close in the default layout and flips strongly toward `BMI` in the reversed layout. The results are close in absolute magnitude and are subject to system/microarchitecture noise. Because `x` values are randomly distributed at insertion time, ordered traversal walks nodes in a pseudo-random allocation order, especially at larger `kN`. These rows are the wrong place to make a single blanket performance claim, and should instead be viewed as stress tests.
+
+![OrderedIterate relative benchmark](benchmarks/data/gbench/figs/OrderedIterate_relative.png)
+*Ordered `x` traversal, default index layout, relative view.*
+
+**The fair ordered-mass comparison is more modest.** Ignoring the specialized `PartOI` bucket variant, `OptIndex` is faster than `BMI` for create, remove, mass modification, and `ModifyX` in this run. It is slower for hashed primary lookup and full insertion-order traversal, and it is not better for `MassRange` at 100k.
+
+**The mixed pressure benchmark favors the partitioned layout, while plain OptIndex is not the best non-partitioned result here.** Pool-based containers, including `PoolBMI` and two `OptIndex` variants, consistently outperform default `BMI`, which shows allocator sensitivity in the composed workload; `PartOI` leads the board across all `kN` values, reflecting cheaper mass updates and bucketed mass maintenance because of the partitioned design. Beyond 10k, `PoolBMI` starts to take over `OptIndex`. At 100k, `MixedSteadyState` is `1.85-1.88 ms/op` for `PartOI`. `PoolBMI` is next at `2.55-2.56 ms/op`, ahead of plain `OptIndex` at `2.69 ms/op` in the default layout and `2.98 ms/op` in the reversed layout. This row is useful because it combines effects, so it should not be decomposed as if it were a pure allocator, lookup, or traversal benchmark. Beyond about `kN = 5000`, the working set starts to exceed private L2 cache on this machine, so the measurements become increasingly sensitive to cache and microarchitecture effects.
+
+![MixedSteadyState relative benchmark](benchmarks/data/gbench/figs/MixedSteadyState_relative.png)
+*Mixed steady-state pressure, default index layout, relative view.*
 
 ### Methodology
 
-- Build: `-O3`, single-threaded
-- Warmup: Google Benchmark default (1 second)  
-- Repetitions: 200 per configuration, median reported
-- Error bars: p5/p95 across repetitions
-- Sizes: N ∈ {50, 100, 500, 1k, 5k, 10k, 50k, 100k}
-- Machine: Intel Core i7 (Linux); Apple M1 results omitted for platform consistency
+- Benchmark target: `bench_particle`, single-threaded Google Benchmark v1.9.1.
+- Compile flags for benchmark targets: `-O3 -march=native -DNDEBUG`.
+- Build knobs: `SET_KN_VALUE`, `WITH_HASH=true`, and both `REV_INDEX=false` and `REV_INDEX=true`.
+- Sizes: `N` in `{50, 100, 500, 1k, 5k, 10k, 50k, 100k}`.
+- Repetitions: 200 per benchmark/filter in the JSON files.
+- Reported values: medians from raw repetition samples; p5/p95 bands are used in the generated figures and summary CSV.
+- Machine as reported by Google Benchmark: `jli-desk`, 20 logical CPUs at 4800 MHz, Linux.
 
-Raw JSON results are in `benchmarks/data/`.
+Raw JSON and logs are in `benchmarks/data/gbench/`. Generated figures and summary CSVs are in `benchmarks/data/gbench/figs/`, including matching `_rev` plots for the reversed index layout.
+
+Benchmarks should be interpreted with standard caution: CPU scaling was enabled in the captured logs, the run was not pinned by default, and these are microbenchmarks over a fixed synthetic particle distribution. Google Benchmark reports its library build type as `release` for the current data.
+
+### Microbenchmarks vs real workloads
+
+These measurements isolate one operation at a time on pre-shaped data. That is useful for understanding where the design pays for hooks, trees, hash buckets, allocation, and membership bookkeeping, but it is not the same as measuring an application loop. Real workloads mix reads, writes, removals, object construction, cache-warming effects, branch predictability, domain logic, and contention with unrelated code.
+
+The results are most relevant when a real workload also has bounded container sizes, repeated access to known views, discrete keys that can be bucketed, and mutation patterns close to the benchmark. They are less predictive for ad hoc queries, continuously distributed keys, allocator-heavy object lifetimes, multi-threaded contention, or end-to-end latency dominated by domain code.
+
+Treat the tables as a map of tradeoffs, not as a universal ranking. The practical test is to model your own hot path and compare the full operation mix.
+
+`MixedSteadyState` is intended for that next layer of comparison. One measured operation keeps `N` particles resident, performs four rounds of batched primary-id removals and replacement inserts, reindexes a batch of mass updates, performs a batch of primary lookups, and scans `BySeq` once. `BMI` versus `PoolBMI` shows allocator sensitivity under the same Boost.MultiIndex design; `PoolBMI` versus `OptIndex` compares pooled Boost.MultiIndex with OptIndex's intrusive fixed-size design; `OptIndex` versus `PartOI` shows whether bucketed mass indexing still helps in the composed workload.
 
 # AI Assistance Statement
 
 ## Scope
 
-Unit tests and benchmark code in this repository were initially generated with AI assistance.
+AI was used for writing benchmarks and unit tests as well as scaffolding, refactoring, and iteration but not for design decisions.
 
 ## Review
 
@@ -453,8 +459,3 @@ All such code has been:
 
 Correctness, design decisions, and performance claims are the responsibility of the human author(s).  
 AI is used as a drafting tool, not as a source of truth.
-
-## Notes
-
-- AI-generated code may be incomplete or suboptimal without review.
-- Benchmarks should be interpreted with standard caution (environment, methodology, workload).
