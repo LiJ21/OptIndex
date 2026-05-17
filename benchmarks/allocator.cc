@@ -1,6 +1,6 @@
 #include <benchmark/benchmark.h>
 
-#include "multimap.h"
+#include "optindex.h"
 
 #include <boost/pool/pool_alloc.hpp>
 
@@ -39,7 +39,7 @@ static constexpr size_t kN = 100'000;
 // ---------------------------------------------------------------------------
 // Your pool allocator wrapper benchmark target
 // ---------------------------------------------------------------------------
-using MyPool = fastmm::FixedSizeLifoPool<Particle, kN>;
+using MyPool = optindex::FixedSizeLifoPool<Particle, kN>;
 
 // ---------------------------------------------------------------------------
 // Helper for std::allocator / boost::fast_pool_allocator

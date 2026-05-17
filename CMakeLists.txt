@@ -44,8 +44,16 @@ foreach(test_src IN LISTS FastMM_TEST_SOURCES)
     set(target_name test_${target_name})
 
     add_executable(${target_name} ${test_src})
-    target_link_libraries(${target_name} PRIVATE FastMM Boost::container GTest::gtest_main)
-    target_include_directories(${target_name} PRIVATE ${Boost_INCLUDE_DIRS})
+    target_link_libraries(${target_name} PRIVATE
+        FastMM
+        Boost::container
+        GTest::gtest_main
+        hdr_histogram_static
+    )
+    target_include_directories(${target_name} PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${hdrhistogram_SOURCE_DIR}/include
+    )
 endforeach()
 
 file(GLOB_RECURSE FastMM_BENCH_SOURCES CONFIGURE_DEPENDS benchmarks/*.cc)
@@ -70,6 +78,20 @@ foreach(bench_src IN LISTS FastMM_BENCH_SOURCES)
     )
     target_compile_options(${target_name} PRIVATE -O3 -march=native -DNDEBUG)
 endforeach()
+if(TARGET bench_particle_latency)
+  target_compile_definitions(bench_particle_latency PRIVATE LB_USE_RDTSC)
+endif()
+if(TARGET bench_allocator_latency)
+  target_compile_definitions(bench_allocator_latency PRIVATE LB_USE_RDTSC)
+endif()
+
+if(DEFINED CACHE_ALIGNED)
+  target_compile_definitions(bench_particle PRIVATE ALIGNED_WITH_CACHELINE=${CACHE_ALIGNED})
+  if(TARGET bench_particle_latency)
+    target_compile_definitions(bench_particle_latency PRIVATE ALIGNED_WITH_CACHELINE=${CACHE_ALIGNED})
+  endif()
+endif()
+
 if(DEFINED SET_KN_VALUE)
   target_compile_definitions(bench_particle PRIVATE SET_KN=${SET_KN_VALUE})
   if(TARGET bench_particle_latency)
